@@ -132,14 +132,26 @@ jobs:
                       shutil.copyfileobj(src, out, 1024 * 1024)
           print(f'Extracted {len(infos)} entries, {total / 1024**3:.2f} GiB')
 
-          # Exactly one .xcodeproj (a folder holding project.pbxproj), any depth.
-          projects = [p for p in destination.rglob('*.xcodeproj') if (p / 'project.pbxproj').is_file()]
-          if len(projects) != 1:
-              raise SystemExit(f'Expected exactly one .xcodeproj, found {[str(p.relative_to(destination)) for p in projects]}')
-          proj = projects[0]
+          # Find the project: one .xcodeproj or one .xcworkspace (ignoring Pods/ and
+          # the project.xcworkspace inside an .xcodeproj), plus an optional Podfile.
+          def ignored(p):
+              parts = p.relative_to(destination).parts
+              return 'Pods' in parts[:-1] or any(x.endswith(('.xcodeproj', '.xcworkspace')) for x in parts[:-1])
+          rel = lambda p: p.relative_to(destination).as_posix() or '.'
+          projects = [p for p in destination.rglob('*.xcodeproj') if (p / 'project.pbxproj').is_file() and not ignored(p)]
+          workspaces = [p for p in destination.rglob('*.xcworkspace') if (p / 'contents.xcworkspacedata').is_file() and not ignored(p)]
+          podfiles = [p for p in destination.rglob('Podfile') if p.is_file() and not ignored(p)]
+          print('xcodeproj:', [rel(p) for p in projects], 'xcworkspace:', [rel(p) for p in workspaces], 'Podfile:', [rel(p) for p in podfiles])
+          if len(podfiles) > 1:
+              raise SystemExit('More than one Podfile in the archive.')
+          if len(workspaces) > 1 or (not workspaces and len(projects) != 1):
+              raise SystemExit('Archive must contain exactly one .xcodeproj (or one .xcworkspace).')
+          base = workspaces[0].parent if workspaces else projects[0].parent
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
-              env.write(f'PROJECT_DIR_REL={proj.parent.relative_to(destination).as_posix() or "."}\n')
-              env.write(f'PROJECT_NAME={proj.name}\n')
+              env.write(f'PROJECT_DIR_REL={rel(base)}\n')
+              env.write(f'PROJECT_NAME={projects[0].name if projects else ""}\n')
+              env.write(f'WORKSPACE_PATH={workspaces[0] if workspaces else ""}\n')
+              env.write(f'POD_DIR_REL={rel(podfiles[0].parent) if podfiles else ""}\n')
 
           # ZIPs made on Windows lose the executable bit. Restore it on scripts
           # (#!) and Mach-O binaries (Unity 6 runs il2cpp during the build).
@@ -157,6 +169,45 @@ jobs:
           rm -f "$RUNNER_TEMP/source.zip"
           df -h "$RUNNER_TEMP"
 
+      - name: Install CocoaPods dependencies
+        if: env.POD_DIR_REL != ''
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$RUNNER_TEMP/source/$POD_DIR_REL"
+          echo "CocoaPods $(pod --version)"
+          ok=0
+          for attempt in 1 2 3; do
+            if [[ $attempt -eq 1 ]]; then pod install && ok=1; else pod install --repo-update && ok=1; fi
+            [[ $ok -eq 1 ]] && break
+            echo "pod install failed (attempt $attempt), retrying"; sleep 15
+          done
+          [[ $ok -eq 1 ]] || { echo 'pod install failed 3 times.' >&2; exit 1; }
+          # Xcode 15+ cannot link pods whose deployment target is below 12.0
+          # (libarclite is gone). Raise them to the app's minimum.
+          python3 - "${DEPLOYMENT_TARGET:-12.0}" <<'PY'
+          import pathlib, re, sys
+          floor = tuple(int(x) for x in sys.argv[1].split('.'))
+          pbx = pathlib.Path('Pods/Pods.xcodeproj/project.pbxproj')
+          if pbx.is_file():
+              text, n = pbx.read_text(encoding='utf-8'), 0
+              def fix(m):
+                  global n
+                  v = tuple(int(x) for x in m.group(1).split('.'))
+                  if v < floor:
+                      n += 1
+                      return f'IPHONEOS_DEPLOYMENT_TARGET = {".".join(map(str, floor))};'
+                  return m.group(0)
+              text = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = ([0-9.]+);', fix, text)
+              pbx.write_text(text, encoding='utf-8')
+              print(f'Pods deployment target raised to {sys.argv[1]} in {n} places')
+          PY
+          ws=$(find . -maxdepth 1 -name '*.xcworkspace' -type d | head -1)
+          [[ -n "$ws" ]] || { echo 'pod install did not create an .xcworkspace.' >&2; exit 1; }
+          echo "WORKSPACE_PATH=$PWD/${ws#./}" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR_REL=$POD_DIR_REL" >> "$GITHUB_ENV"
+          echo "Using workspace $ws"
+
       - name: Build archive without code signing
         shell: bash
         run: |
@@ -164,10 +215,16 @@ jobs:
           cd "$RUNNER_TEMP/source/$PROJECT_DIR_REL"
           extra=()
           [[ -n "$DEPLOYMENT_TARGET" ]] && extra+=("IPHONEOS_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET")
+          if [[ -n "${WORKSPACE_PATH:-}" ]]; then
+            target=(-workspace "$WORKSPACE_PATH")
+          else
+            target=(-project "$PROJECT_NAME")
+          fi
+          echo "Building ${target[*]} scheme $SCHEME"
           start=$(date +%s)
           set +e
           xcodebuild archive -quiet \
-            -project "$PROJECT_NAME" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+            "${target[@]}" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
             -sdk iphoneos -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/export.xcarchive" \
             -derivedDataPath "$RUNNER_TEMP/dd" \
