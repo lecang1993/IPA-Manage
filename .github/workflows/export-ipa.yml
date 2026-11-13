@@ -1,0 +1,222 @@
+name: Export unsigned IPA
+run-name: "mu-export-${{ inputs.export_id }}"
+
+# Public repository: logs and artifacts are readable by any GitHub user.
+# The source ZIP and the IPA therefore travel encrypted with the repository
+# secret IPA_KEY (AES-256-CBC, PBKDF2-SHA256, 200000 iterations). Only the
+# web on the VPS, which holds the same key, can read them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_id:
+        description: Job id from the web (32 hex)
+        required: true
+        type: string
+      source_url:
+        description: One-time HTTPS URL of the encrypted source ZIP
+        required: true
+        type: string
+      source_sha256:
+        description: SHA-256 of the encrypted source ZIP
+        required: true
+        type: string
+      scheme:
+        description: Xcode scheme
+        required: true
+        default: Unity-iPhone
+        type: string
+      configuration:
+        description: Xcode configuration
+        required: true
+        default: Release
+        type: string
+      xcode_version:
+        description: Xcode version on the runner (16.4, 26.3 ...)
+        required: true
+        default: '16.4'
+        type: string
+      deployment_target:
+        description: Optional IPHONEOS_DEPLOYMENT_TARGET override (e.g. 15.0)
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: export-${{ inputs.export_id }}
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: macos-15
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      EXPORT_ID: ${{ inputs.export_id }}
+      XCODE_VERSION: ${{ inputs.xcode_version }}
+      SCHEME: ${{ inputs.scheme }}
+      CONFIGURATION: ${{ inputs.configuration }}
+      DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
+    steps:
+      - name: Validate request
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$EXPORT_ID" =~ ^[a-f0-9]{32}$ ]] || { echo 'Invalid export id.' >&2; exit 2; }
+          [[ "$XCODE_VERSION" =~ ^[0-9]{2}(\.[0-9]{1,2}){0,2}$ ]] || { echo 'Invalid Xcode version.' >&2; exit 2; }
+          [[ "$SCHEME" =~ ^[A-Za-z0-9_.\ -]{1,64}$ ]] || { echo 'Invalid scheme.' >&2; exit 2; }
+          [[ "$CONFIGURATION" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { echo 'Invalid configuration.' >&2; exit 2; }
+          [[ -z "$DEPLOYMENT_TARGET" || "$DEPLOYMENT_TARGET" =~ ^[0-9]{1,2}\.[0-9]{1,2}$ ]] || { echo 'Invalid deployment target.' >&2; exit 2; }
+          DEV="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          [[ -d "$DEV" ]] || { echo "Xcode $XCODE_VERSION is not installed on this runner. Installed:" >&2; ls -d /Applications/Xcode_*.app >&2; exit 2; }
+          echo "DEVELOPER_DIR=$DEV" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$DEV" xcodebuild -version
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          df -h "$RUNNER_TEMP"
+
+      - name: Download and decrypt source
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          SOURCE_SHA256: ${{ inputs.source_sha256 }}
+          IPA_KEY: ${{ secrets.IPA_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$IPA_KEY" ]] || { echo 'Repository secret IPA_KEY is missing.' >&2; exit 2; }
+          [[ "$SOURCE_URL" == https://* && "$SOURCE_URL" != *[[:space:]]* ]] || { echo 'Invalid source URL.' >&2; exit 2; }
+          [[ "$SOURCE_SHA256" =~ ^[a-f0-9]{64}$ ]] || { echo 'Invalid source digest.' >&2; exit 2; }
+          # The VPS may use a self-signed certificate (IP address, no domain). That is
+          # safe here: the file is AES-encrypted and its SHA-256 is checked below.
+          curl --insecure --fail --silent --show-error --location --retry 3 --retry-all-errors \
+               --connect-timeout 20 --max-time 2400 "$SOURCE_URL" -o "$RUNNER_TEMP/source.enc"
+          echo "$SOURCE_SHA256  $RUNNER_TEMP/source.enc" | shasum -a 256 -c - >/dev/null
+          ls -l "$RUNNER_TEMP/source.enc"
+          openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:IPA_KEY \
+               -in "$RUNNER_TEMP/source.enc" -out "$RUNNER_TEMP/source.zip"
+          rm -f "$RUNNER_TEMP/source.enc"
+          mkdir -p "$RUNNER_TEMP/source"
+          python3 - "$RUNNER_TEMP/source.zip" "$RUNNER_TEMP/source" <<'PY'
+          import os, pathlib, shutil, sys, zipfile
+          archive, destination = map(pathlib.Path, sys.argv[1:])
+          max_entries, max_total, max_file, max_ratio = 300000, 16 * 1024**3, 2 * 1024**3, 1000
+          seen, total = set(), 0
+          root = destination.resolve()
+          with zipfile.ZipFile(archive) as zf:
+              infos = zf.infolist()
+              if not infos or len(infos) > max_entries:
+                  raise SystemExit('Source archive has no or too many entries.')
+              for info in infos:
+                  name = info.filename.replace('\\', '/')
+                  parts = name.split('/')
+                  if (not name or name.startswith('/') or ':' in parts[0] or '\x00' in name
+                          or any(p in {'', '.', '..'} for p in parts[:-1]) or name in seen
+                          or info.flag_bits & 0x1):
+                      raise SystemExit(f'Unsafe or duplicate path in archive: {name!r}')
+                  if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                      raise SystemExit(f'Symlink not allowed: {name!r}')
+                  seen.add(name)
+                  total += info.file_size
+                  if info.file_size > max_file or total > max_total:
+                      raise SystemExit('Source archive is too large.')
+                  if info.compress_size and info.file_size > info.compress_size * max_ratio + 1024 * 1024:
+                      raise SystemExit('Unsafe compression ratio.')
+                  target = (destination / pathlib.PurePosixPath(name)).resolve()
+                  if not target.is_relative_to(root):
+                      raise SystemExit('Path escapes extraction directory.')
+                  if name.endswith('/'):
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info) as src, target.open('wb') as out:
+                      shutil.copyfileobj(src, out, 1024 * 1024)
+          print(f'Extracted {len(infos)} entries, {total / 1024**3:.2f} GiB')
+
+          # Exactly one .xcodeproj (a folder holding project.pbxproj), any depth.
+          projects = [p for p in destination.rglob('*.xcodeproj') if (p / 'project.pbxproj').is_file()]
+          if len(projects) != 1:
+              raise SystemExit(f'Expected exactly one .xcodeproj, found {[str(p.relative_to(destination)) for p in projects]}')
+          proj = projects[0]
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'PROJECT_DIR_REL={proj.parent.relative_to(destination).as_posix() or "."}\n')
+              env.write(f'PROJECT_NAME={proj.name}\n')
+
+          # ZIPs made on Windows lose the executable bit. Restore it on scripts
+          # (#!) and Mach-O binaries (Unity 6 runs il2cpp during the build).
+          magics = (b'#!', b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf')
+          fixed = 0
+          for path in destination.rglob('*'):
+              if path.is_file() and not path.is_symlink():
+                  with path.open('rb') as fh:
+                      head = fh.read(4)
+                  if head.startswith(magics):
+                      path.chmod(path.stat().st_mode | 0o111)
+                      fixed += 1
+          print(f'Executable bit restored on {fixed} files')
+          PY
+          rm -f "$RUNNER_TEMP/source.zip"
+          df -h "$RUNNER_TEMP"
+
+      - name: Build archive without code signing
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$RUNNER_TEMP/source/$PROJECT_DIR_REL"
+          extra=()
+          [[ -n "$DEPLOYMENT_TARGET" ]] && extra+=("IPHONEOS_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET")
+          start=$(date +%s)
+          set +e
+          xcodebuild archive -quiet \
+            -project "$PROJECT_NAME" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/export.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO VALID_ARCHS=arm64 \
+            ENABLE_BITCODE=NO COMPILER_INDEX_STORE_ENABLE=NO GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 'CODE_SIGN_IDENTITY=' \
+            "${extra[@]}" 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error:|fatal|BUILD|ARCHIVE|\*\*"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "xcodebuild exit $rc after $(( ($(date +%s) - start) / 60 )) min"
+          if [[ $rc -ne 0 ]]; then
+            echo '---- last 120 lines ----'; tail -120 "$RUNNER_TEMP/xcodebuild.log"; exit $rc
+          fi
+          df -h "$RUNNER_TEMP"
+
+      - name: Package and encrypt IPA
+        env:
+          IPA_KEY: ${{ secrets.IPA_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 <<'PY'
+          import os, pathlib, plistlib, shutil
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          apps = [p for p in (temp / 'export.xcarchive/Products/Applications').glob('*.app') if p.is_dir()]
+          if len(apps) != 1:
+              raise SystemExit(f'Expected one archived .app, found {len(apps)}.')
+          info = plistlib.load((apps[0] / 'Info.plist').open('rb'))
+          if info.get('CFBundlePackageType') != 'APPL' or 'iPhoneOS' not in info.get('CFBundleSupportedPlatforms', []):
+              raise SystemExit('Archive is not an iOS device application.')
+          print('App:', apps[0].name, info.get('CFBundleIdentifier'), info.get('CFBundleShortVersionString'), info.get('CFBundleVersion'))
+          payload = temp / 'ipa/Payload'
+          payload.mkdir(parents=True)
+          shutil.copytree(apps[0], payload / apps[0].name, symlinks=True)
+          PY
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$RUNNER_TEMP/unsigned.ipa" Payload)
+          rm -rf "$RUNNER_TEMP/ipa" "$RUNNER_TEMP/dd"
+          ls -l "$RUNNER_TEMP/unsigned.ipa"
+          mkdir -p "$RUNNER_TEMP/out"
+          openssl enc -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -salt -pass env:IPA_KEY \
+               -in "$RUNNER_TEMP/unsigned.ipa" -out "$RUNNER_TEMP/out/unsigned.ipa.enc"
+          shasum -a 256 "$RUNNER_TEMP/unsigned.ipa" | cut -d' ' -f1 > "$RUNNER_TEMP/out/unsigned.ipa.sha256"
+          rm -f "$RUNNER_TEMP/unsigned.ipa"
+
+      - name: Upload encrypted IPA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ipa-${{ inputs.export_id }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
